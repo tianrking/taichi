@@ -1,0 +1,124 @@
+name: Engineer 06 native CPU research
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        required: true
+        default: ba0e81dce559fb63a5958bf82feb1d00c55c02fe
+        type: string
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      CC: clang-15
+      CXX: clang++-15
+      BUILD_NUM_THREADS: '2'
+      TAICHI_CMAKE_ARGS: -DTI_WITH_CUDA=OFF -DTI_WITH_METAL=OFF -DTI_WITH_OPENGL=OFF -DTI_WITH_VULKAN=OFF -DTI_WITH_GGUI=OFF -DTI_WITH_DX11=OFF -DTI_WITH_DX12=OFF -DTI_BUILD_TESTS=ON -DTI_BUILD_EXAMPLES=OFF
+      TI_WANTED_ARCHS: cpu
+      TI_OFFLINE_CACHE: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Record exact original source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence
+          git rev-parse HEAD | tee evidence/source-head.txt
+          test "$(git rev-parse HEAD)" = '${{ inputs.source_ref }}'
+          git submodule status --recursive | tee evidence/submodules.txt
+          git hash-object python/taichi/lang/ast/ast_transformer.py | tee evidence/ast-blob.txt
+          free -h
+          df -h
+      - name: Prepare official native build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang-15 lld-15 libtinfo5 libzstd-dev libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+          python -m pip install 'setuptools<71' wheel 'cmake<4' ninja scikit-build pybind11 'numpy<2' colorama dill rich
+          python -m pip install -r requirements_dev.txt -r requirements_test.txt 'numpy<2'
+          curl --fail --location --retry 3 https://github.com/taichi-dev/taichi_assets/releases/download/llvm15/taichi-llvm-15-linux.zip -o "$RUNNER_TEMP/llvm15.zip"
+          test "$(stat -c%s "$RUNNER_TEMP/llvm15.zip")" = 449455601
+          sha256sum "$RUNNER_TEMP/llvm15.zip" | tee evidence/llvm15-sha256.txt
+          python - <<'PY'
+          import os, pathlib, zipfile
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'llvm15'
+          with zipfile.ZipFile(root.with_suffix('.zip')) as archive:
+              for item in archive.infolist():
+                  parts = pathlib.PurePosixPath(item.filename).parts[1:]
+                  if not parts:
+                      continue
+                  assert '..' not in parts
+                  target = root.joinpath(*parts)
+                  if item.is_dir():
+                      target.mkdir(parents=True, exist_ok=True)
+                  else:
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_bytes(archive.read(item))
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'LLVM_DIR={root}\n')
+          PY
+          python -m pip freeze > evidence/python-dependencies.txt
+          clang-15 --version | tee evidence/compiler.txt
+      - name: Build native runtime from exact source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python setup.py develop 2>&1 | tee evidence/source-build.log
+          python - <<'PY' | tee evidence/native-import.txt
+          import pathlib, taichi
+          from taichi._lib import core
+          from taichi.lang.ast import ast_transformer
+          root = pathlib.Path.cwd().resolve()
+          for module in (taichi, core, ast_transformer):
+              path = pathlib.Path(module.__file__).resolve()
+              print(module.__name__, path)
+              assert path.is_relative_to(root), path
+          taichi.init(arch=taichi.cpu, enable_fallback=False)
+          PY
+      - name: Original assignment controls
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python tests/run_tests.py -a cpu -t 2 -v test_assign test_tuple_assign test_return 2>&1 | tee evidence/original-controls.log
+      - name: Original issue reproduction
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > issue_4459_repro.py <<'PY'
+          import taichi as ti
+          ti.init(arch=ti.cpu, enable_fallback=False)
+          @ti.func
+          def foo():
+              return 1, ti.Vector([1])
+          @ti.kernel
+          def bar():
+              _, _ = foo()
+          bar()
+          PY
+          set +e
+          python issue_4459_repro.py > evidence/original-red.log 2>&1
+          result=$?
+          set -e
+          cat evidence/original-red.log
+          echo "$result" > evidence/original-exit-code.txt
+          test "$result" -ne 0
+          grep -E 'cannot assign|cannot augassign|Taichi.*Error' evidence/original-red.log
+      - name: Archive native evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engineer-06-native-research
+          path: evidence/
+          retention-days: 30
