@@ -1,0 +1,352 @@
+name: Engineer 06 exact native source proof
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        required: true
+        default: 3b1c3279dd781ba923f9f76d7defe973fe5d2583
+        type: string
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      CC: clang-15
+      CXX: clang++-15
+      BUILD_NUM_THREADS: '2'
+      TAICHI_CMAKE_ARGS: -DTI_WITH_CUDA=OFF -DTI_WITH_METAL=OFF -DTI_WITH_OPENGL=OFF -DTI_WITH_VULKAN=OFF -DTI_WITH_GGUI=OFF -DTI_WITH_DX11=OFF -DTI_WITH_DX12=OFF -DTI_BUILD_TESTS=ON -DTI_BUILD_EXAMPLES=OFF
+      TI_WANTED_ARCHS: cpu
+      TI_OFFLINE_CACHE: '0'
+      CCACHE_DIR: ${{ github.workspace }}/.native-ccache
+      CCACHE_MAXSIZE: 2G
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Provide Python 3.12 for required repository hooks
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Use upstream primary Python 3.11 for native CPU validation
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Record exact original source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence
+          git rev-parse HEAD | tee evidence/source-head.txt
+          test "$(git rev-parse HEAD)" = '${{ inputs.source_ref }}'
+          git submodule status --recursive | tee evidence/submodules.txt
+          git hash-object python/taichi/lang/ast/ast_transformer.py | tee evidence/ast-blob.txt
+          git hash-object tests/python/test_function_tuple_return.py | tee evidence/test-blob.txt
+          cp tests/python/test_function_tuple_return.py evidence/original-test-source.py.txt
+          free -h
+          df -h
+      - name: Prepare official native build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang-15 lld-15 ccache libtinfo5 libzstd-dev libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+          printf 'rich==13.9.4\ntwine==6.2.0\nscikit-build==0.19.1\n' > evidence/dependency-constraints.txt
+          python -m pip install -c evidence/dependency-constraints.txt 'setuptools<71' wheel 'cmake<4' ninja scikit-build pybind11 'numpy<2' colorama dill rich
+          python -m pip install -c evidence/dependency-constraints.txt -r requirements_dev.txt -r requirements_test.txt 'numpy<2'
+          python -m pip check | tee evidence/dependency-check.txt
+          curl --fail --location --retry 3 https://github.com/taichi-dev/taichi_assets/releases/download/llvm15/taichi-llvm-15-linux.zip -o "$RUNNER_TEMP/llvm15.zip"
+          test "$(stat -c%s "$RUNNER_TEMP/llvm15.zip")" = 449455601
+          sha256sum "$RUNNER_TEMP/llvm15.zip" | tee evidence/llvm15-sha256.txt
+          python - <<'PY'
+          import os, pathlib, zipfile
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'llvm15'
+          with zipfile.ZipFile(root.with_suffix('.zip')) as archive:
+              for item in archive.infolist():
+                  parts = pathlib.PurePosixPath(item.filename).parts[1:]
+                  if not parts:
+                      continue
+                  assert '..' not in parts
+                  target = root.joinpath(*parts)
+                  if item.is_dir():
+                      target.mkdir(parents=True, exist_ok=True)
+                  else:
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_bytes(archive.read(item))
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'LLVM_DIR={root}\n')
+          PY
+          python -m pip freeze > evidence/python-dependencies.txt
+          clang-15 --version | tee evidence/compiler.txt
+      - uses: actions/cache/restore@v4
+        id: cache
+        with:
+          path: .native-ccache
+          key: cpu-clang15-py311-${{ inputs.source_ref }}
+          restore-keys: cpu-clang15-py311-
+      - name: Install isolated raw receipt helper
+        shell: bash
+        run: |
+          cat > evidence/capture-source.py <<'PY'
+          import hashlib
+          from datetime import datetime, timezone
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          
+          ROOT = Path.cwd().resolve()
+          OUT = ROOT / 'evidence'
+          EXPECTED = '3b1c3279dd781ba923f9f76d7defe973fe5d2583'
+          PHASE = sys.argv[1]
+          
+          
+          def git(repo, *args):
+              return subprocess.check_output(['git', '-C', str(repo), *args])
+          
+          
+          def digest(raw):
+              return hashlib.sha256(raw).hexdigest()
+          
+          
+          records = []
+          repositories = []
+          problems = []
+          
+          
+          def visit(repo, prefix, expected_head):
+              head = git(repo, 'rev-parse', 'HEAD').decode().strip()
+              stage_raw = git(repo, 'ls-files', '--stage', '-z')
+              tree_raw = git(repo, 'ls-tree', '-r', '-z', 'HEAD')
+              tree = {}
+              for item in tree_raw.split(b'\0'):
+                  if item:
+                      metadata, path = item.split(b'\t', 1)
+                      mode, kind, blob = metadata.decode().split()
+                      tree[path.decode()] = (mode, blob)
+              stage = {}
+              for item in stage_raw.split(b'\0'):
+                  if item:
+                      metadata, path = item.split(b'\t', 1)
+                      mode, blob, index_stage = metadata.decode().split()
+                      if index_stage != '0':
+                          problems.append(f'{prefix}{path.decode()}: unmerged stage {index_stage}')
+                      stage[path.decode()] = (mode, blob)
+              label = prefix.rstrip('/') or 'root'
+              # Keep raw Git output, including untracked artifacts, without restoring anything.
+              evidence_name = label.replace('/', '__')
+              for name, args in {
+                  'ls-files-stage': ('ls-files', '--stage', '-z'),
+                  'head-tree': ('ls-tree', '-r', '-z', 'HEAD'),
+                  'status-all': ('status', '--porcelain=v1', '-z', '--untracked-files=all'),
+                  'status-tracked': ('status', '--porcelain=v1', '-z', '--untracked-files=no', '--ignore-submodules=untracked'),
+                  'diff-head': ('diff', '--binary', 'HEAD'),
+                  'diff-index': ('diff', '--cached', '--binary'),
+              }.items():
+                  raw = git(repo, *args)
+                  (OUT / f'{PHASE}-{evidence_name}-{name}.raw').write_bytes(raw)
+                  if name in ('status-tracked', 'diff-head', 'diff-index') and raw:
+                      problems.append(f'{label}: {name} is not empty')
+              index_tree = git(repo, 'write-tree').decode().strip()
+              head_tree = git(repo, 'rev-parse', 'HEAD^{tree}').decode().strip()
+              repositories.append({'path': label, 'head': head, 'expectedHead': expected_head,
+                                   'headTree': head_tree, 'indexTree': index_tree,
+                                   'stageRawSha256': digest(stage_raw), 'headTreeRawSha256': digest(tree_raw)})
+              if head != expected_head or stage != tree or index_tree != head_tree:
+                  problems.append(f'{label}: HEAD/index differs from expected source')
+              for relative, (mode, index_blob) in sorted(stage.items()):
+                  path = repo / relative
+                  full_relative = prefix + relative
+                  if mode == '160000':
+                      records.append({'path': full_relative, 'mode': mode, 'headBlob': tree.get(relative, ('', ''))[1],
+                                      'indexBlob': index_blob, 'kind': 'gitlink'})
+                      if not path.is_dir():
+                          problems.append(f'{full_relative}: missing initialized submodule')
+                      else:
+                          visit(path, full_relative + '/', index_blob)
+                      continue
+                  try:
+                      raw = os.fsencode(os.readlink(path)) if mode == '120000' else path.read_bytes()
+                  except OSError as error:
+                      problems.append(f'{full_relative}: cannot read raw bytes: {error}')
+                      continue
+                  raw_blob = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
+                  records.append({'path': full_relative, 'mode': mode, 'kind': 'symlink' if mode == '120000' else 'file',
+                                  'bytes': len(raw), 'sha256': digest(raw), 'rawGitBlob': raw_blob,
+                                  'headBlob': tree.get(relative, ('', ''))[1], 'indexBlob': index_blob})
+                  if raw_blob != index_blob:
+                      problems.append(f'{full_relative}: raw bytes differ from indexed Git blob')
+          
+          
+          import taichi
+          from importlib.metadata import version
+          from taichi._lib import core
+          from taichi.lang.ast import ast_transformer
+          
+          compiled_sha = core.get_commit_hash()
+          modules = {}
+          for module in (taichi, core, ast_transformer):
+              path = Path(module.__file__).resolve()
+              modules[module.__name__] = {'path': str(path), 'sha256': digest(path.read_bytes())}
+              if not path.is_relative_to(ROOT):
+                  problems.append(f'{module.__name__}: import outside checkout')
+          if compiled_sha != EXPECTED or sys.version_info[:2] != (3, 11):
+              problems.append('compiled SHA or Python version differs')
+          for package, expected in [('rich', '13.9.4'), ('twine', '6.2.0'), ('scikit-build', '0.19.1')]:
+              if version(package) != expected:
+                  problems.append(f'{package}: unexpected version {version(package)}')
+          visit(ROOT, '', EXPECTED)
+          native_files = {}
+          for path in [Path(core.__file__).resolve(), ROOT / 'build/taichi_cpp_tests']:
+              native_files[str(path.relative_to(ROOT))] = {'bytes': path.stat().st_size, 'sha256': digest(path.read_bytes())}
+          receipt = {'phase': PHASE, 'expectedSha': EXPECTED, 'compiledSha': compiled_sha,
+                     'capturedAtUtc': datetime.now(timezone.utc).isoformat(),
+                     'python': sys.version, 'modules': modules, 'repositories': repositories,
+                     'records': sorted(records, key=lambda item: item['path']), 'nativeFiles': native_files,
+                     'problems': problems}
+          if PHASE != 'before-tests':
+              previous = json.loads((OUT / 'before-tests-manifest.json').read_text())
+              for key in ('expectedSha', 'compiledSha', 'modules', 'repositories', 'records', 'nativeFiles'):
+                  if receipt[key] != previous[key]:
+                      problems.append(f'{key}: differs from actual before-tests receipt')
+          (OUT / f'{PHASE}-manifest.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          print(json.dumps({'phase': PHASE, 'compiledSha': compiled_sha, 'trackedRecords': len(records),
+                            'repositories': len(repositories), 'nativeFiles': native_files, 'problems': problems}, indent=2))
+          if problems:
+              raise SystemExit(1)
+          PY
+      - name: Build native runtime from exact source
+        id: native
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export TAICHI_CMAKE_ARGS="$TAICHI_CMAKE_ARGS -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          python setup.py --force-cmake develop 2>&1 | tee evidence/source-build.log
+          python -m pip install -c evidence/dependency-constraints.txt 'rich==13.9.4' 'twine==6.2.0'
+          ccache --show-stats | tee evidence/ccache.txt
+          python - <<'PY' | tee evidence/native-import.txt
+          import pathlib, subprocess, sys, taichi
+          from importlib.metadata import version
+          from taichi._lib import core
+          from taichi.lang.ast import ast_transformer
+          root = pathlib.Path.cwd().resolve()
+          expected = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          print('compiled_commit', core.get_commit_hash())
+          assert core.get_commit_hash() == expected
+          assert sys.version_info[:2] == (3, 11)
+          assert version('rich') == '13.9.4'
+          for module in (taichi, core, ast_transformer):
+              path = pathlib.Path(module.__file__).resolve()
+              print(module.__name__, path)
+              assert path.is_relative_to(root), path
+          taichi.init(arch=taichi.cpu, enable_fallback=False)
+          PY
+          python -m pip freeze > evidence/python-dependencies-native.txt
+          python -m pip check | tee evidence/dependency-check-native.txt
+      - name: Actual full tracked source and native binary before first tests
+        id: before
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python evidence/capture-source.py before-tests | tee evidence/before-tests-receipt.log
+      - name: Native annotated tuple return regression suite
+        if: always() && steps.before.outcome == 'success'
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          python tests/run_tests.py -a cpu -t 2 -v test_function_tuple_return 2>&1 | tee evidence/tuple-return-regression.log
+          statuses=("${PIPESTATUS[@]}")
+          printf '%s\n' "${statuses[0]}" > evidence/tuple-return-regression-exit.txt
+          printf '%s\n' "${statuses[1]}" > evidence/tuple-return-regression-tee-exit.txt
+          test "${statuses[1]}" -eq 0 || exit "${statuses[1]}"
+          exit "${statuses[0]}"
+      - name: Native existing frontend integration
+        if: always() && steps.before.outcome == 'success'
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          python tests/run_tests.py -a cpu -t 2 -v test_assign test_tuple_assign test_return test_function test_function_parameter_by_value test_lexical_scope test_scope_errors 2>&1 | tee evidence/frontend-integration.log
+          statuses=("${PIPESTATUS[@]}")
+          printf '%s\n' "${statuses[0]}" > evidence/frontend-integration-exit.txt
+          printf '%s\n' "${statuses[1]}" > evidence/frontend-integration-tee-exit.txt
+          test "${statuses[1]}" -eq 0 || exit "${statuses[1]}"
+          exit "${statuses[0]}"
+      - name: Full native CPU C++ suite
+        if: always() && steps.before.outcome == 'success'
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          test -x build/taichi_cpp_tests || exit 1
+          build/taichi_cpp_tests --gtest_list_tests | tee evidence/cpp-test-list.txt
+          test "${PIPESTATUS[0]}" -eq 0 || exit 1
+          grep 'LlvmAotTest\.' evidence/cpp-test-list.txt || exit 1
+          python tests/run_tests.py --cpp -a cpu -t 2 -v 2>&1 | tee evidence/cpp-full.log
+          statuses=("${PIPESTATUS[@]}")
+          printf '%s\n' "${statuses[0]}" > evidence/cpp-full-exit.txt
+          printf '%s\n' "${statuses[1]}" > evidence/cpp-full-tee-exit.txt
+          test "${statuses[1]}" -eq 0 || exit "${statuses[1]}"
+          exit "${statuses[0]}"
+      - name: Full native CPU Python suite
+        if: always() && steps.before.outcome == 'success'
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          python tests/run_tests.py -a cpu -t 2 -v -k 'not torch and not paddle' -m 'not run_in_serial' 2>&1 | tee evidence/cpu-full.log
+          statuses=("${PIPESTATUS[@]}")
+          printf '%s\n' "${statuses[0]}" > evidence/cpu-full-exit.txt
+          printf '%s\n' "${statuses[1]}" > evidence/cpu-full-tee-exit.txt
+          test "${statuses[1]}" -eq 0 || exit "${statuses[1]}"
+          exit "${statuses[0]}"
+      - name: Full native CPU serial Python suite
+        if: always() && steps.before.outcome == 'success'
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          python tests/run_tests.py -a cpu -t 1 -v -k 'not torch and not paddle' -m run_in_serial 2>&1 | tee evidence/cpu-serial.log
+          statuses=("${PIPESTATUS[@]}")
+          printf '%s\n' "${statuses[0]}" > evidence/cpu-serial-exit.txt
+          printf '%s\n' "${statuses[1]}" > evidence/cpu-serial-tee-exit.txt
+          test "${statuses[1]}" -eq 0 || exit "${statuses[1]}"
+          exit "${statuses[0]}"
+      - name: Actual source and binary after last native test before hooks
+        if: always() && steps.before.outcome == 'success'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python evidence/capture-source.py after-native | tee evidence/after-native-receipt.log
+      - name: Required style hooks
+        if: always() && steps.before.outcome == 'success'
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          python3.12 --version
+          pre-commit run --files python/taichi/lang/ast/ast_transformer.py tests/python/test_function_tuple_return.py 2>&1 | tee evidence/pre-commit.log
+          statuses=("${PIPESTATUS[@]}")
+          printf '%s\n' "${statuses[0]}" > evidence/pre-commit-exit.txt
+          printf '%s\n' "${statuses[1]}" > evidence/pre-commit-tee-exit.txt
+          test "${statuses[1]}" -eq 0 || exit "${statuses[1]}"
+          exit "${statuses[0]}"
+      - name: Actual source and binary after hooks without source restoration
+        if: always() && steps.before.outcome == 'success'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python evidence/capture-source.py after-hooks | tee evidence/after-hooks-receipt.log
+      - name: Archive native source proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engineer-06-native-source-proof
+          path: evidence/
+          retention-days: 30
