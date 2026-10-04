@@ -176,11 +176,21 @@ jobs:
                       problems.append(f'{full_relative}: cannot read raw bytes: {error}')
                       continue
                   raw_blob = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
+                  # Git's declared checkout EOL can differ from its canonical object bytes.
+                  # Always retain raw SHA-256 and compare it unchanged across phases.
+                  clean_blob = raw_blob
+                  attributes = None
+                  if mode != '120000' and raw_blob != index_blob:
+                      clean_blob = subprocess.check_output(
+                          ['git', '-C', str(repo), 'hash-object', f'--path={relative}', '--stdin'], input=raw
+                      ).decode().strip()
+                      attributes = git(repo, 'check-attr', '--all', '-z', '--', relative).decode().split('\0')
                   records.append({'path': full_relative, 'mode': mode, 'kind': 'symlink' if mode == '120000' else 'file',
                                   'bytes': len(raw), 'sha256': digest(raw), 'rawGitBlob': raw_blob,
+                                  'cleanGitBlob': clean_blob, 'gitAttributes': attributes,
                                   'headBlob': tree.get(relative, ('', ''))[1], 'indexBlob': index_blob})
-                  if raw_blob != index_blob:
-                      problems.append(f'{full_relative}: raw bytes differ from indexed Git blob')
+                  if clean_blob != index_blob:
+                      problems.append(f'{full_relative}: Git attribute-filtered bytes differ from indexed blob')
           
           
           import taichi
