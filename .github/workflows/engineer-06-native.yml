@@ -107,6 +107,28 @@ jobs:
               assert path.is_relative_to(root), path
           taichi.init(arch=taichi.cpu, enable_fallback=False)
           PY
+      - name: Verify existing CLI dependency failure and compatible environment
+        if: inputs.mode == 'green'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASELINE=ba0e81dce559fb63a5958bf82feb1d00c55c02fe
+          test "$(git rev-parse HEAD:python/taichi/_main.py)" = "$(git rev-parse "$BASELINE:python/taichi/_main.py")"
+          git rev-parse "$BASELINE:python/taichi/_main.py" | tee evidence/baseline-cli-blob.txt
+          git restore --source="$BASELINE" --worktree python
+          git hash-object python/taichi/lang/ast/ast_transformer.py | tee evidence/baseline-python-ast-blob.txt
+          set +e
+          python tests/run_tests.py -a cpu -t 1 -v test_cli -k test_cli_example 2>&1 | tee evidence/baseline-cli-rich15.log
+          cli_status=${PIPESTATUS[0]}
+          set -e
+          test "$cli_status" -ne 0
+          grep "AttributeError: module 'rich' has no attribute 'table'" evidence/baseline-cli-rich15.log
+          git restore --source=HEAD --worktree python
+          git diff --exit-code
+          python -m pip install 'rich==13.9.4'
+          python -m pip freeze > evidence/python-dependencies-compatible.txt
+          python tests/run_tests.py -a cpu -t 1 -v test_cli 2>&1 | tee evidence/cli-compatible.log
+          git hash-object python/taichi/lang/ast/ast_transformer.py tests/python/test_function_tuple_return.py | tee evidence/restored-formal-blobs.txt
       - name: Native annotated tuple return regression suite
         id: regression
         shell: bash
@@ -134,9 +156,14 @@ jobs:
         run: |
           set -euxo pipefail
           python tests/run_tests.py -a cpu -t 2 -v -k 'not torch and not paddle' -m 'not run_in_serial' 2>&1 | tee evidence/cpu-full.log
+      - name: Full native CPU serial Python suite
+        if: always() && inputs.mode == 'green' && steps.native.outcome == 'success'
+        shell: bash
+        run: |
+          set -euxo pipefail
           python tests/run_tests.py -a cpu -t 1 -v -k 'not torch and not paddle' -m run_in_serial 2>&1 | tee evidence/cpu-serial.log
       - name: Required style hooks and exact post-hook sources
-        if: inputs.mode == 'green'
+        if: always() && inputs.mode == 'green' && steps.native.outcome == 'success'
         shell: bash
         run: |
           set -euxo pipefail
