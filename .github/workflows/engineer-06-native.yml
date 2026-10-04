@@ -39,9 +39,14 @@ jobs:
           submodules: recursive
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - name: Provide Python 3.12 for required repository hooks
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Use upstream primary Python 3.11 for native CPU validation
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: Record exact original source
         shell: bash
         run: |
@@ -61,8 +66,10 @@ jobs:
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y clang-15 lld-15 ccache libtinfo5 libzstd-dev libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
-          python -m pip install 'setuptools<71' wheel 'cmake<4' ninja scikit-build pybind11 'numpy<2' colorama dill 'rich==13.9.4'
-          python -m pip install -r requirements_dev.txt -r requirements_test.txt 'numpy<2'
+          printf 'rich==13.9.4\ntwine==6.2.0\nscikit-build==0.19.1\n' > evidence/dependency-constraints.txt
+          python -m pip install -c evidence/dependency-constraints.txt 'setuptools<71' wheel 'cmake<4' ninja scikit-build pybind11 'numpy<2' colorama dill rich
+          python -m pip install -c evidence/dependency-constraints.txt -r requirements_dev.txt -r requirements_test.txt 'numpy<2'
+          python -m pip check | tee evidence/dependency-check.txt
           curl --fail --location --retry 3 https://github.com/taichi-dev/taichi_assets/releases/download/llvm15/taichi-llvm-15-linux.zip -o "$RUNNER_TEMP/llvm15.zip"
           test "$(stat -c%s "$RUNNER_TEMP/llvm15.zip")" = 449455601
           sha256sum "$RUNNER_TEMP/llvm15.zip" | tee evidence/llvm15-sha256.txt
@@ -90,8 +97,8 @@ jobs:
         id: cache
         with:
           path: .native-ccache
-          key: cpu-clang15-py312-${{ inputs.source_ref }}
-          restore-keys: cpu-clang15-py312-
+          key: cpu-clang15-py311-${{ inputs.source_ref }}
+          restore-keys: cpu-clang15-py311-
       - name: Exact baseline native source and full CPU comparison
         if: inputs.compare_baseline
         shell: bash
@@ -101,12 +108,21 @@ jobs:
           git rev-parse HEAD | tee evidence/comparison-baseline-head.txt
           git hash-object python/taichi/lang/ast/ast_transformer.py | tee evidence/comparison-baseline-ast-blob.txt
           export TAICHI_CMAKE_ARGS="$TAICHI_CMAKE_ARGS -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
-          python setup.py develop 2>&1 | tee evidence/comparison-baseline-source-build.log
+          python setup.py --force-cmake develop 2>&1 | tee evidence/comparison-baseline-source-build.log
+          python -m pip install -c evidence/dependency-constraints.txt 'rich==13.9.4' 'twine==6.2.0'
+          python -m pip check | tee evidence/comparison-baseline-dependency-check.txt
+          python -m pip freeze > evidence/comparison-baseline-dependencies.txt
           python - <<'PY' | tee evidence/comparison-baseline-native-import.txt
-          import pathlib, taichi
+          import pathlib, subprocess, sys, taichi
+          from importlib.metadata import version
           from taichi._lib import core
           from taichi.lang.ast import ast_transformer
           root = pathlib.Path.cwd().resolve()
+          expected = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          print('compiled_commit', core.get_commit_hash())
+          assert core.get_commit_hash() == expected
+          assert sys.version_info[:2] == (3, 11)
+          assert version('rich') == '13.9.4'
           for module in (taichi, core, ast_transformer):
               path = pathlib.Path(module.__file__).resolve()
               print(module.__name__, path)
@@ -123,25 +139,38 @@ jobs:
           git diff --exit-code
           test "$(git rev-parse HEAD)" = '${{ inputs.source_ref }}'
           git hash-object python/taichi/lang/ast/ast_transformer.py tests/python/test_function_tuple_return.py | tee evidence/comparison-restored-formal-blobs.txt
+          test "$PWD" = "$GITHUB_WORKSPACE"
+          rm -rf -- "$GITHUB_WORKSPACE/_skbuild" "$GITHUB_WORKSPACE/build"
+          rm -f -- "$GITHUB_WORKSPACE/taichi/common/commit_hash.h" "$GITHUB_WORKSPACE/taichi/common/version.h"
+          rm -f -- "$GITHUB_WORKSPACE"/python/taichi/_lib/core/*.so
       - name: Build native runtime from exact source
         id: native
         shell: bash
         run: |
           set -euxo pipefail
           export TAICHI_CMAKE_ARGS="$TAICHI_CMAKE_ARGS -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
-          python setup.py develop 2>&1 | tee evidence/source-build.log
+          python setup.py --force-cmake develop 2>&1 | tee evidence/source-build.log
+          python -m pip install -c evidence/dependency-constraints.txt 'rich==13.9.4' 'twine==6.2.0'
           ccache --show-stats | tee evidence/ccache.txt
           python - <<'PY' | tee evidence/native-import.txt
-          import pathlib, taichi
+          import pathlib, subprocess, sys, taichi
+          from importlib.metadata import version
           from taichi._lib import core
           from taichi.lang.ast import ast_transformer
           root = pathlib.Path.cwd().resolve()
+          expected = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          print('compiled_commit', core.get_commit_hash())
+          assert core.get_commit_hash() == expected
+          assert sys.version_info[:2] == (3, 11)
+          assert version('rich') == '13.9.4'
           for module in (taichi, core, ast_transformer):
               path = pathlib.Path(module.__file__).resolve()
               print(module.__name__, path)
               assert path.is_relative_to(root), path
           taichi.init(arch=taichi.cpu, enable_fallback=False)
           PY
+          python -m pip freeze > evidence/python-dependencies-native.txt
+          python -m pip check | tee evidence/dependency-check-native.txt
       - name: Verify existing CLI dependency failure and compatible environment
         if: inputs.mode == 'green' && !inputs.compare_baseline
         shell: bash
@@ -203,6 +232,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          python3.12 --version
           pre-commit run --files python/taichi/lang/ast/ast_transformer.py tests/python/test_function_tuple_return.py 2>&1 | tee evidence/pre-commit.log
           git diff --exit-code
           git rev-parse HEAD | tee evidence/post-hook-head.txt
@@ -213,7 +243,7 @@ jobs:
         if: always() && steps.native.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
         with:
           path: .native-ccache
-          key: cpu-clang15-py312-${{ inputs.source_ref }}
+          key: cpu-clang15-py311-${{ inputs.source_ref }}
       - name: Archive native evidence
         if: always()
         uses: actions/upload-artifact@v4
