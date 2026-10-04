@@ -6,6 +6,13 @@ on:
         required: true
         default: ba0e81dce559fb63a5958bf82feb1d00c55c02fe
         type: string
+      mode:
+        required: true
+        default: red
+        type: choice
+        options:
+          - red
+          - green
 permissions:
   contents: read
 jobs:
@@ -19,6 +26,8 @@ jobs:
       TAICHI_CMAKE_ARGS: -DTI_WITH_CUDA=OFF -DTI_WITH_METAL=OFF -DTI_WITH_OPENGL=OFF -DTI_WITH_VULKAN=OFF -DTI_WITH_GGUI=OFF -DTI_WITH_DX11=OFF -DTI_WITH_DX12=OFF -DTI_BUILD_TESTS=ON -DTI_BUILD_EXAMPLES=OFF
       TI_WANTED_ARCHS: cpu
       TI_OFFLINE_CACHE: '0'
+      CCACHE_DIR: ${{ github.workspace }}/.native-ccache
+      CCACHE_MAXSIZE: 2G
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,7 +54,7 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y clang-15 lld-15 libtinfo5 libzstd-dev libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+          sudo apt-get install -y clang-15 lld-15 ccache libtinfo5 libzstd-dev libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
           python -m pip install 'setuptools<71' wheel 'cmake<4' ninja scikit-build pybind11 'numpy<2' colorama dill rich
           python -m pip install -r requirements_dev.txt -r requirements_test.txt 'numpy<2'
           curl --fail --location --retry 3 https://github.com/taichi-dev/taichi_assets/releases/download/llvm15/taichi-llvm-15-linux.zip -o "$RUNNER_TEMP/llvm15.zip"
@@ -71,11 +80,19 @@ jobs:
           PY
           python -m pip freeze > evidence/python-dependencies.txt
           clang-15 --version | tee evidence/compiler.txt
+      - uses: actions/cache@v4
+        with:
+          path: .native-ccache
+          key: cpu-clang15-py312-${{ inputs.source_ref }}
+          restore-keys: cpu-clang15-py312-
       - name: Build native runtime from exact source
+        id: native
         shell: bash
         run: |
           set -euxo pipefail
+          export TAICHI_CMAKE_ARGS="$TAICHI_CMAKE_ARGS -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
           python setup.py develop 2>&1 | tee evidence/source-build.log
+          ccache --show-stats | tee evidence/ccache.txt
           python - <<'PY' | tee evidence/native-import.txt
           import pathlib, taichi
           from taichi._lib import core
@@ -87,34 +104,42 @@ jobs:
               assert path.is_relative_to(root), path
           taichi.init(arch=taichi.cpu, enable_fallback=False)
           PY
-      - name: Original assignment controls
+      - name: Native annotated tuple return regression suite
+        id: regression
         shell: bash
         run: |
           set -euxo pipefail
-          python tests/run_tests.py -a cpu -t 2 -v test_assign test_tuple_assign test_return 2>&1 | tee evidence/original-controls.log
-      - name: Original issue reproduction
+          python tests/run_tests.py -a cpu -t 2 -v test_function_tuple_return 2>&1 | tee evidence/tuple-return-regression.log
+      - name: Native existing frontend integration
+        if: always() && steps.native.outcome == 'success'
         shell: bash
         run: |
           set -euxo pipefail
-          cat > issue_4459_repro.py <<'PY'
-          import taichi as ti
-          ti.init(arch=ti.cpu, enable_fallback=False)
-          @ti.func
-          def foo():
-              return 1, ti.Vector([1])
-          @ti.kernel
-          def bar():
-              _, _ = foo()
-          bar()
-          PY
-          set +e
-          python issue_4459_repro.py > evidence/original-red.log 2>&1
-          result=$?
-          set -e
-          cat evidence/original-red.log
-          echo "$result" > evidence/original-exit-code.txt
-          test "$result" -ne 0
-          grep -E 'cannot assign|cannot augassign|Taichi.*Error' evidence/original-red.log
+          python tests/run_tests.py -a cpu -t 2 -v test_assign test_tuple_assign test_return test_function test_function_parameter_by_value test_lexical_scope test_scope_errors 2>&1 | tee evidence/frontend-integration.log
+      - name: Full native CPU C++ suite
+        if: inputs.mode == 'green'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python tests/run_tests.py --cpp -a cpu -t 2 -v 2>&1 | tee evidence/cpp-full.log
+      - name: Full native CPU Python suite
+        if: inputs.mode == 'green'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python tests/run_tests.py -a cpu -t 2 -v -k 'not torch and not paddle' -m 'not run_in_serial' 2>&1 | tee evidence/cpu-full.log
+          python tests/run_tests.py -a cpu -t 1 -v -k 'not torch and not paddle' -m run_in_serial 2>&1 | tee evidence/cpu-serial.log
+      - name: Required style hooks and exact post-hook sources
+        if: inputs.mode == 'green'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          pre-commit run --files python/taichi/lang/ast/ast_transformer.py tests/python/test_function_tuple_return.py 2>&1 | tee evidence/pre-commit.log
+          git diff --exit-code
+          git rev-parse HEAD | tee evidence/post-hook-head.txt
+          git hash-object python/taichi/lang/ast/ast_transformer.py tests/python/test_function_tuple_return.py | tee evidence/post-hook-blobs.txt
+          cp python/taichi/lang/ast/ast_transformer.py evidence/ast_transformer.py.txt
+          cp tests/python/test_function_tuple_return.py evidence/test_function_tuple_return.py.txt
       - name: Archive native evidence
         if: always()
         uses: actions/upload-artifact@v4
