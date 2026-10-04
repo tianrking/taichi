@@ -80,7 +80,8 @@ jobs:
           PY
           python -m pip freeze > evidence/python-dependencies.txt
           clang-15 --version | tee evidence/compiler.txt
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: cache
         with:
           path: .native-ccache
           key: cpu-clang15-py312-${{ inputs.source_ref }}
@@ -121,6 +122,9 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          test -x build/taichi_cpp_tests
+          build/taichi_cpp_tests --gtest_list_tests | tee evidence/cpp-test-list.txt
+          grep 'LlvmAotTest\.' evidence/cpp-test-list.txt
           python tests/run_tests.py --cpp -a cpu -t 2 -v 2>&1 | tee evidence/cpp-full.log
       - name: Full native CPU Python suite
         if: inputs.mode == 'green'
@@ -140,6 +144,11 @@ jobs:
           git hash-object python/taichi/lang/ast/ast_transformer.py tests/python/test_function_tuple_return.py | tee evidence/post-hook-blobs.txt
           cp python/taichi/lang/ast/ast_transformer.py evidence/ast_transformer.py.txt
           cp tests/python/test_function_tuple_return.py evidence/test_function_tuple_return.py.txt
+      - uses: actions/cache/save@v4
+        if: always() && steps.native.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: .native-ccache
+          key: cpu-clang15-py312-${{ inputs.source_ref }}
       - name: Archive native evidence
         if: always()
         uses: actions/upload-artifact@v4
