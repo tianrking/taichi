@@ -4,7 +4,7 @@ on:
     inputs:
       source_ref:
         required: true
-        default: ba0e81dce559fb63a5958bf82feb1d00c55c02fe
+        default: 575866eca229dab22ae6a27271e53fea4e7b20aa
         type: string
       mode:
         required: true
@@ -47,6 +47,8 @@ jobs:
           test "$(git rev-parse HEAD)" = '${{ inputs.source_ref }}'
           git submodule status --recursive | tee evidence/submodules.txt
           git hash-object python/taichi/lang/ast/ast_transformer.py | tee evidence/ast-blob.txt
+          git hash-object tests/python/test_function_tuple_return.py | tee evidence/test-blob.txt
+          cp tests/python/test_function_tuple_return.py evidence/original-test-source.py.txt
           free -h
           df -h
       - name: Prepare official native build dependencies
